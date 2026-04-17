@@ -1,0 +1,443 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    signInWithCustomToken, 
+    onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    collection, 
+    doc, 
+    setDoc, 
+    onSnapshot 
+} from 'firebase/firestore';
+
+// ==========================================
+// 1. การตั้งค่า Firebase & Environment
+// ==========================================
+let app, auth, db;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'insurance-class-demo';
+
+try {
+    if (typeof __firebase_config !== 'undefined') {
+        const firebaseConfig = JSON.parse(__firebase_config);
+        app = initializeApp(firebaseConfig);
+        auth = getAuth(app);
+        db = getFirestore(app);
+    }
+} catch (error) {
+    console.error("Firebase initialization error:", error);
+}
+
+// ==========================================
+// 2. ข้อมูลวิดีโอหลักสูตร (จำลอง)
+// ==========================================
+const COURSE_VIDEOS = [
+    { id: 'dQw4w9WgXcQ', title: 'บทที่ 1: ปฐมนิเทศตัวแทนใหม่ และเป้าหมาย', duration: '3:32' },
+    { id: 'jNQXAC9IVRw', title: 'บทที่ 2: จรรยาบรรณและข้อปฏิบัติของตัวแทนประกันชีวิต', duration: '0:28' },
+    { id: 'M7lc1UVf-VE', title: 'บทที่ 3: พื้นฐานแบบประกันและการวิเคราะห์ความต้องการ', duration: '1:30' },
+    { id: 'kJQP7kiw5Fk', title: 'บทที่ 4: เทคนิคการเปิดใจและเข้าพบลูกค้า', duration: '3:50' }
+];
+
+// ==========================================
+// 3. Components หลัก
+// ==========================================
+const App = () => {
+    const [user, setUser] = useState(null);
+    const [progress, setProgress] = useState({}); // เก็บสถานะว่าวิดีโอไหนดูกจบแล้วบ้าง { videoId: true }
+    const [currentVideo, setCurrentVideo] = useState(COURSE_VIDEOS[0]);
+    const [playerReady, setPlayerReady] = useState(false);
+    const [toasts, setToasts] = useState([]);
+    
+    // ตั้งค่าสำหรับ LINE Webhook
+    const [showSettings, setShowSettings] = useState(false);
+    const [webhookUrl, setWebhookUrl] = useState('');
+
+    const playerRef = useRef(null);
+    const ytReadyRef = useRef(false);
+
+    // ----------------------------------------
+    // Auth & Firebase Sync
+    // ----------------------------------------
+    useEffect(() => {
+        if (!auth) return;
+
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth error:", err);
+            }
+        };
+
+        initAuth();
+
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+            setUser(currentUser);
+        });
+
+        // ดึง webhook url จาก localStorage (ถ้ามี)
+        const savedWebhook = localStorage.getItem('insurance_webhook_url');
+        if (savedWebhook) setWebhookUrl(savedWebhook);
+
+        return () => unsubscribe();
+    }, []);
+
+    // ดึงข้อมูล Progress จาก Firestore
+    useEffect(() => {
+        if (!user || !db) return;
+
+        const progressRef = collection(db, 'artifacts', appId, 'users', user.uid, 'progress');
+        
+        const unsubscribe = onSnapshot(progressRef, (snapshot) => {
+            const newProgress = {};
+            snapshot.forEach(doc => {
+                newProgress[doc.id] = doc.data().completed;
+            });
+            setProgress(newProgress);
+        }, (error) => {
+            console.error("Error fetching progress:", error);
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    // ----------------------------------------
+    // YouTube IFrame API Setup
+    // ----------------------------------------
+    useEffect(() => {
+        // Load YouTube API Script only once
+        if (!window.YT) {
+            const tag = document.createElement('script');
+            tag.src = "https://www.youtube.com/iframe_api";
+            const firstScriptTag = document.getElementsByTagName('script')[0];
+            firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+
+            window.onYouTubeIframeAPIReady = () => {
+                ytReadyRef.current = true;
+                initPlayer(currentVideo.id);
+            };
+        } else if (window.YT && window.YT.Player && !playerRef.current) {
+            ytReadyRef.current = true;
+            initPlayer(currentVideo.id);
+        }
+
+        return () => {
+            if (playerRef.current) {
+                playerRef.current.destroy();
+                playerRef.current = null;
+            }
+        };
+    }, []);
+
+    // เปลี่ยนวิดีโอ
+    useEffect(() => {
+        if (playerRef.current && ytReadyRef.current && playerReady) {
+            playerRef.current.loadVideoById(currentVideo.id);
+        } else if (ytReadyRef.current && !playerRef.current) {
+            initPlayer(currentVideo.id);
+        }
+    }, [currentVideo]);
+
+    const initPlayer = (videoId) => {
+        if (playerRef.current) return; // Prevent multiple initializations
+        
+        playerRef.current = new window.YT.Player('ytplayer', {
+            height: '100%',
+            width: '100%',
+            videoId: videoId,
+            playerVars: {
+                'playsinline': 1,
+                'rel': 0,
+                'modestbranding': 1
+            },
+            events: {
+                'onReady': () => setPlayerReady(true),
+                'onStateChange': onPlayerStateChange
+            }
+        });
+    };
+
+    const onPlayerStateChange = (event) => {
+        // 0 = ENDED (ดูจบแล้ว)
+        if (event.data === 0) {
+            handleVideoCompleted(currentVideo);
+        }
+    };
+
+    // ----------------------------------------
+    // Business Logic: ดูจบ & ส่ง LINE
+    // ----------------------------------------
+    const handleVideoCompleted = async (video) => {
+        // ถ้าเคยดูจบแล้ว ไม่ต้องส่งแจ้งเตือนซ้ำ
+        if (progress[video.id]) return;
+
+        // 1. อัปเดต UI ทันที
+        setProgress(prev => ({ ...prev, [video.id]: true }));
+        addToast(`🎉 ยินดีด้วย! คุณเรียนจบ: ${video.title}`, 'success');
+
+        // 2. บันทึกลง Firestore
+        if (user && db) {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'progress', video.id);
+                await setDoc(docRef, {
+                    completed: true,
+                    completedAt: new Date().toISOString(),
+                    videoTitle: video.title
+                }, { merge: true });
+            } catch (err) {
+                console.error("Failed to save progress", err);
+            }
+        }
+
+        // 3. ส่ง LINE Notification ผ่าน Webhook
+        sendLineNotification(video.title);
+    };
+
+    const sendLineNotification = async (videoTitle) => {
+        const agentName = user ? `ตัวแทน ID: ${user.uid.substring(0, 6)}` : "ตัวแทนใหม่";
+        const message = `\n🎓 แจ้งเตือนการเรียน\nผู้เรียน: ${agentName}\nเรียนจบ: ${videoTitle}\nสถานะ: ผ่าน ✅`;
+
+        if (!webhookUrl) {
+            // โหมดจำลอง (ถ้าไม่ได้ตั้งค่า Webhook)
+            setTimeout(() => {
+                addToast(`(จำลอง LINE) 🔔 ${message}`, 'info');
+            }, 1000);
+            return;
+        }
+
+        try {
+            // ส่งไปที่ Webhook (เช่น Google Apps Script, Zapier) ที่เขียนรับ POST ไว้
+            await fetch(webhookUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ message: message, video: videoTitle, user: agentName })
+            });
+            addToast(`ส่งแจ้งเตือนเข้า LINE กลุ่มสำเร็จ!`, 'success');
+        } catch (error) {
+            console.error("Webhook error:", error);
+            addToast(`ระบบส่งแจ้งเตือนล้มเหลว (ตรวจสอบ Webhook URL)`, 'error');
+        }
+    };
+
+    // ----------------------------------------
+    // UI Helpers
+    // ----------------------------------------
+    const addToast = (message, type = 'info') => {
+        const id = Date.now();
+        setToasts(prev => [...prev, { id, message, type }]);
+        setTimeout(() => {
+            setToasts(prev => prev.filter(t => t.id !== id));
+        }, 5000);
+    };
+
+    const saveSettings = () => {
+        localStorage.setItem('insurance_webhook_url', webhookUrl);
+        setShowSettings(false);
+        addToast('บันทึกการตั้งค่าระบบเรียบร้อย', 'success');
+    };
+
+    const calculateTotalProgress = () => {
+        const total = COURSE_VIDEOS.length;
+        const completed = COURSE_VIDEOS.filter(v => progress[v.id]).length;
+        return Math.round((completed / total) * 100);
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-50 flex flex-col font-sans">
+            {/* Header */}
+            <header className="bg-blue-900 text-white shadow-md z-10 relative">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <svg className="w-8 h-8 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 14l9-5-9-5-9 5 9 5z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 14l9-5-9-5-9 5 9 5zm0 0v6" /></svg>
+                        <h1 className="text-xl font-bold tracking-wide">ห้องเรียนตัวแทนประกันชีวิต (Agent Academy)</h1>
+                    </div>
+                    <button 
+                        onClick={() => setShowSettings(true)}
+                        className="text-blue-200 hover:text-white transition-colors flex items-center gap-2 text-sm"
+                    >
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                        ตั้งค่าผู้ดูแล
+                    </button>
+                </div>
+            </header>
+
+            <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 flex flex-col lg:flex-row gap-8">
+                
+                {/* Left Column: Video Player Area */}
+                <div className="flex-1 flex flex-col">
+                    <div className="bg-black rounded-xl overflow-hidden shadow-lg relative" style={{ paddingTop: '56.25%' /* 16:9 Aspect Ratio */ }}>
+                        {/* YouTube Player Container */}
+                        <div id="ytplayer" className="absolute top-0 left-0 w-full h-full border-0"></div>
+                        
+                        {!playerReady && (
+                            <div className="absolute inset-0 flex items-center justify-center text-white bg-gray-900">
+                                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
+                            </div>
+                        )}
+                    </div>
+                    
+                    <div className="mt-6 bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                        <div className="flex justify-between items-start">
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-800 mb-2">{currentVideo.title}</h2>
+                                <p className="text-gray-500 text-sm">
+                                    ดูให้จบเพื่อรับรองสถานะการผ่านบทเรียน ระบบจะแจ้งเตือนผู้จัดการ (หัวหน้าหน่วย) ของคุณอัตโนมัติเมื่อเรียนจบ
+                                </p>
+                            </div>
+                            {progress[currentVideo.id] && (
+                                <div className="bg-green-100 text-green-700 px-4 py-2 rounded-full flex items-center gap-2 font-medium border border-green-200">
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                    เรียนจบแล้ว
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Right Column: Playlist & Progress */}
+                <div className="w-full lg:w-1/3 flex flex-col gap-6">
+                    {/* Progress Card */}
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                        <h3 className="text-lg font-bold text-gray-800 mb-4">ความคืบหน้าหลักสูตร</h3>
+                        <div className="flex items-center justify-between mb-2">
+                            <span className="text-sm font-medium text-gray-600">สถานะรวม</span>
+                            <span className="text-sm font-bold text-blue-600">{calculateTotalProgress()}%</span>
+                        </div>
+                        <div className="w-full bg-gray-200 rounded-full h-2.5">
+                            <div 
+                                className="bg-blue-600 h-2.5 rounded-full transition-all duration-500" 
+                                style={{ width: `${calculateTotalProgress()}%` }}
+                            ></div>
+                        </div>
+                        <p className="text-xs text-gray-500 mt-3 text-center">
+                            ผู้ใช้งาน: {user ? user.uid.substring(0, 8) : 'กำลังเชื่อมต่อ...'}
+                        </p>
+                    </div>
+
+                    {/* Playlist */}
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden flex-1">
+                        <div className="bg-gray-50 p-4 border-b border-gray-100">
+                            <h3 className="font-bold text-gray-800">สารบัญบทเรียน</h3>
+                        </div>
+                        <ul className="divide-y divide-gray-100 max-h-[500px] overflow-y-auto">
+                            {COURSE_VIDEOS.map((video, index) => {
+                                const isCurrent = currentVideo.id === video.id;
+                                const isCompleted = progress[video.id];
+
+                                return (
+                                    <li 
+                                        key={video.id}
+                                        onClick={() => setCurrentVideo(video)}
+                                        className={`p-4 cursor-pointer hover:bg-blue-50 transition-colors flex gap-3
+                                            ${isCurrent ? 'bg-blue-50 border-l-4 border-blue-500' : 'border-l-4 border-transparent'}
+                                        `}
+                                    >
+                                        <div className="flex-shrink-0 mt-1">
+                                            {isCompleted ? (
+                                                <div className="w-6 h-6 rounded-full bg-green-500 flex items-center justify-center text-white">
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                </div>
+                                            ) : (
+                                                <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold
+                                                    ${isCurrent ? 'border-blue-500 text-blue-500' : 'border-gray-300 text-gray-400'}
+                                                `}>
+                                                    {index + 1}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div>
+                                            <p className={`font-medium text-sm leading-tight mb-1 ${isCurrent ? 'text-blue-700' : 'text-gray-700'}`}>
+                                                {video.title}
+                                            </p>
+                                            <p className="text-xs text-gray-500">{video.duration} นาที</p>
+                                        </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    </div>
+                </div>
+            </main>
+
+            {/* Toasts / Notifications */}
+            <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
+                {toasts.map(toast => (
+                    <div 
+                        key={toast.id} 
+                        className={`px-6 py-3 rounded-lg shadow-lg text-white text-sm font-medium animate-fade-in-up flex items-center gap-2
+                            ${toast.type === 'success' ? 'bg-green-600' : toast.type === 'error' ? 'bg-red-600' : 'bg-blue-600'}
+                        `}
+                    >
+                        {toast.type === 'success' && <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>}
+                        {toast.message}
+                    </div>
+                ))}
+            </div>
+
+            {/* Settings Modal (For Line Webhook setup) */}
+            {showSettings && (
+                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+                        <div className="p-6 border-b border-gray-100 flex justify-between items-center">
+                            <h2 className="text-xl font-bold text-gray-800">ตั้งค่าระบบ (สำหรับหัวหน้าหน่วย)</h2>
+                            <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-gray-600">
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-6">
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                LINE Notify Webhook URL
+                            </label>
+                            <input 
+                                type="text"
+                                value={webhookUrl}
+                                onChange={(e) => setWebhookUrl(e.target.value)}
+                                placeholder="https://hook.make.com/..."
+                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm mb-2"
+                            />
+                            <p className="text-xs text-gray-500 mb-4">
+                                * เพื่อหลีกเลี่ยงปัญหา CORS ของ Browser กรุณานำ LINE Token ไปผูกกับระบบ Webhook (เช่น Make.com หรือ Google Apps Script) แล้วนำ URL มาใส่ที่นี่ หากเว้นว่างไว้ ระบบจะใช้โหมด "จำลองการแจ้งเตือน"
+                            </p>
+
+                            <div className="flex gap-3 justify-end mt-6">
+                                <button 
+                                    onClick={() => setShowSettings(false)}
+                                    className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm font-medium transition-colors"
+                                >
+                                    ยกเลิก
+                                </button>
+                                <button 
+                                    onClick={saveSettings}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium transition-colors shadow-sm"
+                                >
+                                    บันทึกการตั้งค่า
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            <style dangerouslySetInnerHTML={{__html: `
+                @keyframes fadeInUp {
+                    from { opacity: 0; transform: translateY(10px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                .animate-fade-in-up {
+                    animation: fadeInUp 0.3s ease-out forwards;
+                }
+            `}} />
+        </div>
+    );
+};
+
+export default App;
